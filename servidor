@@ -1,29 +1,269 @@
 #!/usr/bin/env python3
 import asyncio
-from tcp import Servidor
 import re
-
-
+from tcp import Servidor, Conexao 
 def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
+def validar_canal(nome_canal):
+    return nome_canal.startswith(b'#') and validar_nome(nome_canal[1:])
 
-def sair(conexao):
+nick_para_conexao = {}  
+conexao_para_nick = {}  
+canais = {}             
+nick_para_canais = {}   
+buffers = {}           
+
+def enviar_mensagem(conexao: Conexao, mensagem: bytes):
+    """Envia uma mensagem formatada com \r\n"""
+    conexao.enviar(mensagem + b'\r\n')
+
+def broadcast_para_canal(canal_nome_lower: bytes, mensagem: bytes, remetente_conn: Conexao = None):
+    """Envia mensagem para todos no canal, exceto opcionalmente o remetente."""
+    if canal_nome_lower in canais:
+        membros_lower = list(canais[canal_nome_lower]) 
+        for nick_lower in membros_lower:
+            if nick_lower in nick_para_conexao:
+                conexao_destino = nick_para_conexao[nick_lower]
+                if conexao_destino != remetente_conn:
+                    enviar_mensagem(conexao_destino, mensagem)
+
+def obter_usuarios_em_canais_comuns(nick_lower_saindo: bytes):
+    """Retorna um set de conexões que compartilham pelo menos um canal com o usuário."""
+    conexoes_comuns = set()
+    if nick_lower_saindo in nick_para_canais:
+        canais_do_usuario = list(nick_para_canais[nick_lower_saindo]) 
+        for canal_lower in canais_do_usuario:
+            if canal_lower in canais:
+                membros_lower = list(canais[canal_lower]) 
+                for membro_lower in membros_lower:
+                    if membro_lower != nick_lower_saindo and membro_lower in nick_para_conexao:
+                        conexoes_comuns.add(nick_para_conexao[membro_lower])
+    return conexoes_comuns
+
+def processar_ping(conexao: Conexao, args: list):
+    if len(args) < 1:
+        return
+    payload = args[0]
+    enviar_mensagem(conexao, b':server PONG server :' + payload)
+
+def processar_nick(conexao: Conexao, args: list):
+    apelido_atual_bytes = b'*'
+    if conexao in conexao_para_nick:
+        apelido_atual_bytes = conexao_para_nick[conexao]
+
+    if len(args) < 1:
+        enviar_mensagem(conexao, b':server 431 %s :No nickname given' % apelido_atual_bytes)
+        return
+
+    novo_nick = args[0]
+    novo_nick_lower = novo_nick.lower()
+
+    if not validar_nome(novo_nick):
+        enviar_mensagem(conexao, b':server 432 %s %s :Erroneous nickname' % (apelido_atual_bytes, novo_nick))
+        return
+
+    if novo_nick_lower in nick_para_conexao:
+        enviar_mensagem(conexao, b':server 433 %s %s :Nickname is already in use' % (apelido_atual_bytes, novo_nick))
+        return
+
+    
+    if conexao in conexao_para_nick:
+        
+        nick_antigo = conexao_para_nick[conexao]
+        nick_antigo_lower = nick_antigo.lower()
+
+        
+        del nick_para_conexao[nick_antigo_lower]
+        nick_para_conexao[novo_nick_lower] = conexao
+        conexao_para_nick[conexao] = novo_nick
+
+        
+        canais_afetados = list(nick_para_canais.get(nick_antigo_lower, set()))
+        if nick_antigo_lower in nick_para_canais:
+             nick_para_canais[novo_nick_lower] = nick_para_canais.pop(nick_antigo_lower)
+
+        for canal_lower in canais_afetados:
+            if canal_lower in canais:
+                canais[canal_lower].remove(nick_antigo_lower)
+                canais[canal_lower].add(novo_nick_lower)
+
+        
+        mensagem_nick = b':' + nick_antigo + b' NICK ' + novo_nick
+        enviar_mensagem(conexao, mensagem_nick)
+        conexoes_a_notificar = obter_usuarios_em_canais_comuns(novo_nick_lower) 
+        for conn in conexoes_a_notificar:
+             if conn != conexao: 
+                 enviar_mensagem(conn, mensagem_nick)
+
+    else:
+        
+        nick_para_conexao[novo_nick_lower] = conexao
+        conexao_para_nick[conexao] = novo_nick
+        enviar_mensagem(conexao, b':server 001 %s :Welcome' % novo_nick)
+        enviar_mensagem(conexao, b':server 422 %s :MOTD File is missing' % novo_nick)
+
+def processar_privmsg(conexao: Conexao, args: list):
+    if not conexao in conexao_para_nick:
+        return
+
+    if len(args) < 2:
+        return
+
+    destinatario = args[0]
+    mensagem_priv = args[1] 
+    remetente_nick = conexao_para_nick[conexao]
+    mensagem_completa = b':' + remetente_nick + b' PRIVMSG ' + destinatario + b' :' + mensagem_priv
+
+    if destinatario.startswith(b'#'):
+        canal_lower = destinatario.lower()
+        if canal_lower in canais and remetente_nick.lower() in canais[canal_lower]:
+            broadcast_para_canal(canal_lower, mensagem_completa, remetente_conn=conexao)
+
+    else:
+        dest_nick_lower = destinatario.lower()
+        if dest_nick_lower in nick_para_conexao:
+            conexao_destino = nick_para_conexao[dest_nick_lower]
+            enviar_mensagem(conexao_destino, mensagem_completa)
+        # else: Enviar erro 401 
+
+def processar_join(conexao: Conexao, args: list):
+    if not conexao in conexao_para_nick:        return
+
+    if len(args) < 1:
+        # Enviar erro 461
+        return
+
+    canal_nome = args[0]
+    nick = conexao_para_nick[conexao]
+    nick_lower = nick.lower()
+
+    if not validar_canal(canal_nome):
+        enviar_mensagem(conexao, b':server 403 %s %s :No such channel' % (nick, canal_nome)) # Ou 479 ERR_BADCHANNAME? 403 é pedido no enunciado.
+        return
+
+    canal_lower = canal_nome.lower()
+
+    mensagem_join = b':' + nick + b' JOIN :' + canal_nome
+    broadcast_para_canal(canal_lower, mensagem_join)
+    enviar_mensagem(conexao, mensagem_join)
+
+    canais.setdefault(canal_lower, set()).add(nick_lower)
+    nick_para_canais.setdefault(nick_lower, set()).add(canal_lower)
+
+    membros_lower = sorted(list(canais[canal_lower]))
+    membros_orig = [conexao_para_nick[nick_para_conexao[m_l]] for m_l in membros_lower if m_l in nick_para_conexao]
+
+    prefixo_353 = b':server 353 %s = %s :' % (nick, canal_nome)
+    nicks_str = b' '.join(membros_orig)
+    enviar_mensagem(conexao, prefixo_353 + nicks_str)
+
+    enviar_mensagem(conexao, b':server 366 %s %s :End of /NAMES list.' % (nick, canal_nome))
+
+def processar_part(conexao: Conexao, args: list):
+    if not conexao in conexao_para_nick:
+        return # Não registrado
+
+    if len(args) < 1:
+        return # Faltam parâmetros
+
+    canal_nome = args[0]
+
+    canal_lower = canal_nome.lower()
+    nick = conexao_para_nick[conexao]
+    nick_lower = nick.lower()
+
+    if canal_lower not in canais or nick_lower not in canais[canal_lower]:
+        return
+
+    mensagem_part = b':' + nick + b' PART ' + canal_nome
+
+    membros_a_notificar_lower = list(canais.get(canal_lower, set()))
+    for membro_lower in membros_a_notificar_lower:
+        if membro_lower in nick_para_conexao:
+            conn_destino = nick_para_conexao[membro_lower]
+            enviar_mensagem(conn_destino, mensagem_part)
+    if canal_lower in canais: 
+        canais[canal_lower].remove(nick_lower)
+        if not canais[canal_lower]: 
+            del canais[canal_lower]
+
+    if nick_lower in nick_para_canais:
+        nick_para_canais[nick_lower].remove(canal_lower)
+        if not nick_para_canais[nick_lower]:
+            del nick_para_canais[nick_lower]
+
+def sair(conexao: Conexao):
+    """Callback quando uma conexão é fechada pelo cliente."""
     print(conexao, 'conexão fechada')
+    if conexao in conexao_para_nick:
+        nick = conexao_para_nick[conexao]
+        nick_lower = nick.lower()
+
+        mensagem_quit = b':' + nick + b' QUIT :Connection closed'
+        conexoes_a_notificar = obter_usuarios_em_canais_comuns(nick_lower)
+        for conn in conexoes_a_notificar:
+            enviar_mensagem(conn, mensagem_quit)
+
+        canais_do_usuario = list(nick_para_canais.get(nick_lower, set()))
+        for canal_lower in canais_do_usuario:
+            if canal_lower in canais:
+                canais[canal_lower].discard(nick_lower) 
+                if not canais[canal_lower]:
+                    del canais[canal_lower]
+
+        if nick_lower in nick_para_canais:
+            del nick_para_canais[nick_lower]
+        if nick_lower in nick_para_conexao:
+            del nick_para_conexao[nick_lower]
+        del conexao_para_nick[conexao]
+
+    if conexao in buffers:
+        del buffers[conexao]
     conexao.fechar()
 
-
-def dados_recebidos(conexao, dados):
+def dados_recebidos(conexao: Conexao, dados: bytes):
+    """Callback quando dados são recebidos."""
     if dados == b'':
         return sair(conexao)
-    print(conexao, dados)
 
+    buffer = buffers.get(conexao, b'') + dados
+    buffers[conexao] = b'' 
 
-def conexao_aceita(conexao):
+    while b'\r\n' in buffer:
+        linha, buffer = buffer.split(b'\r\n', 1)
+        print(conexao, b'RECEBEU LINHA:', linha) 
+
+        partes = linha.split(b' :', 1)
+        tokens = partes[0].split()
+        if len(partes) > 1:
+            tokens.append(partes[1])
+
+        if not tokens:
+            continue 
+
+        comando = tokens[0].upper() 
+        args = tokens[1:]
+
+        if comando == b'PING':
+            processar_ping(conexao, args)
+        elif comando == b'NICK':
+            processar_nick(conexao, args)
+        elif comando == b'PRIVMSG':
+            processar_privmsg(conexao, args)
+        elif comando == b'JOIN':
+            processar_join(conexao, args)
+        elif comando == b'PART':
+            processar_part(conexao, args)
+
+    buffers[conexao] = buffer
+
+def conexao_aceita(conexao: Conexao):
+    """Callback quando uma nova conexão é aceita."""
     print(conexao, 'nova conexão')
     conexao.registrar_recebedor(dados_recebidos)
 
-
 servidor = Servidor(6667)
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+print("Servidor IRC iniciado na porta 6667...")
 asyncio.get_event_loop().run_forever()
